@@ -1,16 +1,13 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
+import numpy as np
 
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        accuracy, get_world_size, interpolate,
                        is_dist_avail_and_initialized)
 
-from .backbone import build_backbone
-from .matcher import build_matcher_crowd
-
-import numpy as np
-import time
+from scipy.optimize import linear_sum_assignment
 
 
 # the network frmawork of the regression branch
@@ -47,7 +44,7 @@ class RegressionModel(nn.Module):
 
 # the network frmawork of the classification branch
 class ClassificationModel(nn.Module):
-    def __init__(self, num_features_in, num_anchor_points=4, num_classes=80, prior=0.01, feature_size=256):
+    def __init__(self, num_features_in, num_anchor_points=4, num_classes=2, prior=0.01, feature_size=256):
         super(ClassificationModel, self).__init__()
 
         self.num_classes = num_classes
@@ -324,19 +321,240 @@ class SetCriterion_Crowd(nn.Module):
 
         return losses
 
+class BackboneBase_VGG(nn.Module):
+    """
+    backbone: 只用到vgg的backbone部分，但是为了获取预训练权重，必须创建完整的vgg模型，然后load_state_dict，然后截取出特征提取部分的网络层
+    return_interm_layers: 表示是否对backbone再细分: 默认为True，把backbone分成4个body；否则使用一个body表示整个backbone；
+    name: args.backbone 表示backbone的名称
+    """
+    def __init__(self, backbone_name: str, pretrained = True, return_interm_layers = True):
+        super().__init__()
+        
+        assert backbone_name == 'vgg16_bn' , "model assert to be vgg16_bn"
+        if backbone_name == 'vgg16_bn':
+            vgg_layers = make_layers(cfgs['D'], batch_norm=True, sync=False)
+            backbone = VGG(vgg_layers)
+
+        if pretrained:
+            state_dict = torch.load(model_paths[backbone_name])
+            backbone.load_state_dict(state_dict)
+
+        features = list(backbone.features.children())
+
+        if return_interm_layers:
+            if backbone_name == 'vgg16_bn':
+                self.body1 = nn.Sequential(*features[:13])
+                self.body2 = nn.Sequential(*features[13:23])
+                self.body3 = nn.Sequential(*features[23:33])
+                self.body4 = nn.Sequential(*features[33:43])
+            else:
+                self.body1 = nn.Sequential(*features[:9])
+                self.body2 = nn.Sequential(*features[9:16])
+                self.body3 = nn.Sequential(*features[16:23])
+                self.body4 = nn.Sequential(*features[23:30])
+
+        else:
+            if backbone_name == 'vgg16_bn':
+                self.body = nn.Sequential(*features[:44])  # 16x down-sample
+            elif backbone_name == 'vgg16':
+                self.body = nn.Sequential(*features[:30])  # 16x down-sample
+
+        self.return_interm_layers = return_interm_layers
+
+    def forward(self, tensor_list):
+        out = []
+
+        if self.return_interm_layers:
+            xs = tensor_list
+            for _, layer in enumerate([self.body1, self.body2, self.body3, self.body4]):
+                xs = layer(xs)
+                out.append(xs)
+
+        else:
+            xs = self.body(tensor_list)
+            out.append(xs)
+        return out
+
+
+cfgs = {
+    'A': [64, 'M', 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M'],
+    'B': [64, 64, 'M', 128, 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M'],
+    'D': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M', 512, 512, 512, 'M', 512, 512, 512, 'M'],
+    'E': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 256, 'M', 512, 512, 512, 512, 'M', 512, 512, 512, 512, 'M'],
+}
+
+
+model_urls = {
+    'vgg11': 'https://download.pytorch.org/models/vgg11-bbd30ac9.pth',
+    'vgg13': 'https://download.pytorch.org/models/vgg13-c768596a.pth',
+    'vgg16': 'https://download.pytorch.org/models/vgg16-397923af.pth',
+    'vgg19': 'https://download.pytorch.org/models/vgg19-dcbb9e9d.pth',
+    'vgg11_bn': 'https://download.pytorch.org/models/vgg11_bn-6002323d.pth',
+    'vgg13_bn': 'https://download.pytorch.org/models/vgg13_bn-abd245e5.pth',
+    'vgg16_bn': 'https://download.pytorch.org/models/vgg16_bn-6c64b313.pth',
+    'vgg19_bn': 'https://download.pytorch.org/models/vgg19_bn-c79401a0.pth',
+}
+
+
+model_paths = {
+    'vgg16_bn': './weights/vgg16_bn-6c64b313.pth',
+    'vgg16': './weights/vgg16-397923af.pth',
+}
+
+
+class VGG(nn.Module):
+    """  """
+    def __init__(self, features, num_classes=1000, init_weights=True):
+        super(VGG, self).__init__()
+        self.features = features
+        self.avgpool = nn.AdaptiveAvgPool2d((7, 7))
+        self.classifier = nn.Sequential(
+            nn.Linear(512 * 7 * 7, 4096),
+            nn.ReLU(True),
+            nn.Dropout(),
+            nn.Linear(4096, 4096),
+            nn.ReLU(True),
+            nn.Dropout(),
+            nn.Linear(4096, num_classes),
+        )
+        if init_weights:
+            self._initialize_weights()
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        return x
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+
+def make_layers(cfg, batch_norm=False, sync=False):
+    """读取cfg，返回nn.Sequential(*layers)"""
+    layers = []
+    in_channels = 3
+    for v in cfg:
+        if v == 'M':
+            layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
+        else:
+            conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=1)
+            if batch_norm:
+                if sync:
+                    print('use sync backbone')
+                    layers += [conv2d, nn.SyncBatchNorm(v), nn.ReLU(inplace=True)]
+                else:
+                    layers += [conv2d, nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
+            else:
+                layers += [conv2d, nn.ReLU(inplace=True)]
+            in_channels = v
+    return nn.Sequential(*layers)
+
+
+class HungarianMatcher_Crowd(nn.Module):
+    """This class computes an assignment between the targets and the predictions of the network
+
+    For efficiency reasons, the targets don't include the no_object. Because of this, in general,
+    there are more predictions than targets. In this case, we do a 1-to-1 matching of the best predictions,
+    while the others are un-matched (and thus treated as non-objects).
+    """
+
+    def __init__(self, cost_class: float = 1, cost_point: float = 1):
+        """Creates the matcher
+
+        Params:
+            cost_class: This is the relative weight of the foreground object
+            cost_point: This is the relative weight of the L1 error of the points coordinates in the matching cost
+        """
+        super().__init__()
+        self.cost_class = cost_class
+        self.cost_point = cost_point
+        assert cost_class != 0 or cost_point != 0, "all costs cant be 0"
+
+    @torch.no_grad()
+    def forward(self, outputs, targets):
+        """ Performs the matching
+        outputs["pred_logits"]: (batch_size, num_queries, num_classes)
+        outputs["points"]: (batch_size, num_queries, 2)
+
+        targets是一个bs维的列表，对于每一个target：
+        target["labels"]: 一个标量，表示gt点的数量
+        target["points"]: (num_target_points, 2), 表示gt点的数量
+
+        Params:
+            outputs: This is a dict that contains at least these entries: 
+                 "pred_logits": Tensor of dim [batch_size, num_queries, num_classes] with the classification logits
+                 "points": Tensor of dim [batch_size, num_queries, 2] with the predicted point coordinates
+
+            targets: This is a list of targets (len(targets) = batch_size), 
+                where each target is a dict containing:
+                 "labels": Tensor of dim [num_target_points] (where num_target_points is the number of ground-truth
+                           objects in the target) containing the class labels
+                 "points": Tensor of dim [num_target_points, 2] containing the target point coordinates
+
+        Returns:
+            A list of size batch_size, containing tuples of (index_i, index_j) where:
+                - index_i is the indices of the selected predictions (in order)
+                - index_j is the indices of the corresponding selected targets (in order)
+            For each batch element, it holds:
+                len(index_i) = len(index_j) = min(num_queries, num_target_points)
+        """
+        bs, num_queries = outputs["pred_logits"].shape[:2]
+
+        # We flatten to compute the cost matrices in a batch
+        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, num_classes]
+        out_points = outputs["pred_points"].flatten(0, 1)  # [batch_size * num_queries, 2]
+
+        # Also concat the target labels and points
+        # tgt_ids = torch.cat([v["labels"] for v in targets])
+        tgt_ids = torch.cat([v["labels"] for v in targets])
+        tgt_points = torch.cat([v["point"] for v in targets])
+
+        # Compute the classification cost. Contrary to the loss, we don't use the NLL,
+        # but approximate it in 1 - proba[target class].
+        # The 1 is a constant that doesn't change the matching, it can be ommitted.
+        cost_class = -out_prob[:, tgt_ids]
+
+        # Compute the L2 cost between point
+        cost_point = torch.cdist(out_points, tgt_points, p=2)
+
+        # Compute the giou cost between point
+
+        # Final cost matrix , TODO：C矩阵这种实现方式并不好，矩阵中有大量冗余值
+        C = self.cost_point * cost_point + self.cost_class * cost_class # C:(bs*num_queries , bs*num_target_points)
+        C = C.view(bs, num_queries, -1).cpu()  # # C:(bs , num_queries , bs*num_target_points)
+
+        sizes = [len(v["point"]) for v in targets]
+        indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))] # todo:? scipy.linear_sum_assignment():输入是二维矩阵，输出是匹配的元素索引(i,j)，借助一个立方体就好理解
+        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices] # 坐标值格式转换成int类型
+
+
 # create the P2PNet model
 def build(args, training):
     # treats persons as a single class
     num_classes = 1
 
-    backbone = build_backbone(args)
+    backbone = BackboneBase_VGG(args.backbone, True)
+
     model = P2PNet(backbone, args.row, args.line)
     if not training: 
         return model
 
     weight_dict = {'loss_ce': 1, 'loss_points': args.point_loss_coef}
+
     losses = ['labels', 'points']
-    matcher = build_matcher_crowd(args)
+    matcher = HungarianMatcher_Crowd(cost_class=args.set_cost_class, cost_point=args.set_cost_point)
     criterion = SetCriterion_Crowd(num_classes, \
                                 matcher=matcher, weight_dict=weight_dict, \
                                 eos_coef=args.eos_coef, losses=losses)
