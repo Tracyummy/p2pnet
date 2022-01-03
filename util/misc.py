@@ -130,6 +130,28 @@ def nested_tensor_from_tensor_list(tensor_list: List[Tensor]):
     return tensor
 
 
+class NestedTensor(object):
+    def __init__(self, tensors, mask: Optional[Tensor]):
+        self.tensors = tensors
+        self.mask = mask
+
+    def to(self, device):
+        # type: (Device) -> NestedTensor # noqa
+        cast_tensor = self.tensors.to(device)
+        mask = self.mask
+        if mask is not None:
+            assert mask is not None
+            cast_mask = mask.to(device)
+        else:
+            cast_mask = None
+        return NestedTensor(cast_tensor, cast_mask)
+
+    def decompose(self):
+        return self.tensors, self.mask
+
+    def __repr__(self):
+        return str(self.tensors)
+
 def collate_fn_crowd(batch):
     # re-organize the batch, batch是dataset里面__getitem__()方法返回的结果
     batch_new = []
@@ -145,6 +167,33 @@ def collate_fn_crowd(batch):
     batch = list(zip(*batch))
     batch[0] = nested_tensor_from_tensor_list(batch[0]) # batch[0]表示一堆图像(bs*num_patch, c,h,w)，batch[1]表示图像对应的一堆点
     return tuple(batch)
+
+
+def reduce_dict(input_dict, average=True):
+    """
+    Args:
+        input_dict (dict): all the values will be reduced
+        average (bool): whether to do average or sum
+    Reduce the values in the dictionary from all processes so that all processes
+    have the averaged results. Returns a dict with the same fields as
+    input_dict, after reduction.
+    """
+    world_size = get_world_size()
+    if world_size < 2:
+        return input_dict
+    with torch.no_grad():
+        names = []
+        values = []
+        # sort the keys so that they are consistent across processes
+        for k in sorted(input_dict.keys()):
+            names.append(k)
+            values.append(input_dict[k])
+        values = torch.stack(values, dim=0)
+        dist.all_reduce(values)
+        if average:
+            values /= world_size
+        reduced_dict = {k: v for k, v in zip(names, values)}
+    return reduced_dict
 
 
 def get_world_size():
@@ -261,3 +310,7 @@ class FocalLoss(nn.Module):
         else:
             loss = batch_loss.sum()
         return loss
+
+
+if __name__=='__main__':
+    print(get_world_size())

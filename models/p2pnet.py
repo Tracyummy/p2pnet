@@ -84,6 +84,8 @@ class ClassificationModel(nn.Module):
 
 # generate the reference points in grid layout
 def generate_anchor_points(stride=16, row=3, line=3):
+    """生成一个patch内的锚点位置，
+    @param: stride表示当前特征图相对于原图尺寸下采样的步长,"""
     row_step = stride / row
     line_step = stride / line
 
@@ -100,6 +102,7 @@ def generate_anchor_points(stride=16, row=3, line=3):
 
 # shift the meta-anchor to get an acnhor points
 def shift(shape, stride, anchor_points):
+    """先生成grid在原图像中的像素位置"""
     shift_x = (np.arange(0, shape[1]) + 0.5) * stride
     shift_y = (np.arange(0, shape[0]) + 0.5) * stride
 
@@ -152,6 +155,7 @@ class AnchorPoints(nn.Module):
             return torch.from_numpy(all_anchor_points.astype(np.float32))
 
 class Decoder(nn.Module):
+    ''' 就是FPN '''
     def __init__(self, C3_size, C4_size, C5_size, feature_size=256):
         super(Decoder, self).__init__()
 
@@ -225,102 +229,6 @@ class P2PNet(nn.Module):
        
         return out
 
-class SetCriterion_Crowd(nn.Module):
-
-    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses):
-        """ Create the criterion.
-        Parameters:
-            num_classes: number of object categories, omitting the special no-object category
-            matcher: module able to compute a matching between targets and proposals
-            weight_dict: dict containing as key the names of the losses and as values their relative weight.
-            eos_coef: relative classification weight applied to the no-object category
-            losses: list of all the losses to be applied. See get_loss for list of available losses.
-        """
-        super().__init__()
-        self.num_classes = num_classes
-        self.matcher = matcher
-        self.weight_dict = weight_dict
-        self.eos_coef = eos_coef
-        self.losses = losses
-        empty_weight = torch.ones(self.num_classes + 1)
-        empty_weight[0] = self.eos_coef
-        self.register_buffer('empty_weight', empty_weight)
-
-    def loss_labels(self, outputs, targets, indices, num_points):
-        """Classification loss (NLL)
-        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
-        """
-        assert 'pred_logits' in outputs
-        src_logits = outputs['pred_logits']
-
-        idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(src_logits.shape[:2], 0,
-                                    dtype=torch.int64, device=src_logits.device)
-        target_classes[idx] = target_classes_o
-
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
-        losses = {'loss_ce': loss_ce}
-
-        return losses
-
-    def loss_points(self, outputs, targets, indices, num_points):
-
-        assert 'pred_points' in outputs
-        idx = self._get_src_permutation_idx(indices)
-        src_points = outputs['pred_points'][idx]
-        target_points = torch.cat([t['point'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-
-        loss_bbox = F.mse_loss(src_points, target_points, reduction='none')
-
-        losses = {}
-        losses['loss_point'] = loss_bbox.sum() / num_points
-
-        return losses
-
-    def _get_src_permutation_idx(self, indices):
-        # permute predictions following indices
-        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
-        src_idx = torch.cat([src for (src, _) in indices])
-        return batch_idx, src_idx
-
-    def _get_tgt_permutation_idx(self, indices):
-        # permute targets following indices
-        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
-        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
-        return batch_idx, tgt_idx
-
-    def get_loss(self, loss, outputs, targets, indices, num_points, **kwargs):
-        loss_map = {
-            'labels': self.loss_labels,
-            'points': self.loss_points,
-        }
-        assert loss in loss_map, f'do you really want to compute {loss} loss?'
-        return loss_map[loss](outputs, targets, indices, num_points, **kwargs)
-
-    def forward(self, outputs, targets):
-        """ This performs the loss computation.
-        Parameters:
-             outputs: dict of tensors, see the output specification of the model for the format
-             targets: list of dicts, such that len(targets) == batch_size.
-                      The expected keys in each dict depends on the losses applied, see each loss' doc
-        """
-        output1 = {'pred_logits': outputs['pred_logits'], 'pred_points': outputs['pred_points']}
-
-        indices1 = self.matcher(output1, targets)
-
-        num_points = sum(len(t["labels"]) for t in targets)
-        num_points = torch.as_tensor([num_points], dtype=torch.float, device=next(iter(output1.values())).device)
-        if is_dist_avail_and_initialized():
-            torch.distributed.all_reduce(num_points)
-        num_boxes = torch.clamp(num_points / get_world_size(), min=1).item()
-
-        losses = {}
-        for loss in self.losses:
-            losses.update(self.get_loss(loss, output1, targets, indices1, num_boxes))
-
-        return losses
-
 class BackboneBase_VGG(nn.Module):
     """
     backbone: 只用到vgg的backbone部分，但是为了获取预训练权重，必须创建完整的vgg模型，然后load_state_dict，然后截取出特征提取部分的网络层
@@ -336,6 +244,7 @@ class BackboneBase_VGG(nn.Module):
             backbone = VGG(vgg_layers)
 
         if pretrained:
+            print("【Read pretrained model from model_urls[%s]】" % backbone_name)
             state_dict = torch.load(model_paths[backbone_name])
             backbone.load_state_dict(state_dict)
 
@@ -375,7 +284,7 @@ class BackboneBase_VGG(nn.Module):
             out.append(xs)
         return out
 
-
+'''M是MaxPool2d层；数字是conv的输出通道数'''
 cfgs = {
     'A': [64, 'M', 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M'],
     'B': [64, 64, 'M', 128, 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M'],
@@ -442,7 +351,8 @@ class VGG(nn.Module):
 
 
 def make_layers(cfg, batch_norm=False, sync=False):
-    """读取cfg，返回nn.Sequential(*layers)"""
+    """读取cfg，返回nn.Sequential(*layers), 构建网络结构；
+    """
     layers = []
     in_channels = 3
     for v in cfg:
@@ -540,23 +450,122 @@ class HungarianMatcher_Crowd(nn.Module):
         return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices] # 坐标值格式转换成int类型
 
 
-# create the P2PNet model
-def build(args, training):
-    # treats persons as a single class
-    num_classes = 1
+class SetCriterion_Crowd(nn.Module):
+    ''' calc point_loss & cls_loss '''
+    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses):
+        """ Create the criterion.
+        Parameters:
+            num_classes: number of object categories, omitting the special no-object category
+            matcher: module able to compute a matching between targets and proposals
+            weight_dict: dict containing as key the names of the losses and as values their relative weight.
+            eos_coef: relative classification weight applied to the no-object category
+            losses: list of all the losses to be applied. See get_loss for list of available losses.
+        """
+        super().__init__()
+        self.num_classes = num_classes
+        self.matcher = matcher
+        self.weight_dict = weight_dict
+        self.eos_coef = eos_coef
+        self.losses = losses
+        empty_weight = torch.ones(self.num_classes + 1)
+        empty_weight[0] = self.eos_coef
+        self.register_buffer('empty_weight', empty_weight)
 
-    backbone = BackboneBase_VGG(args.backbone, True)
+    def loss_labels(self, outputs, targets, indices, num_points):
+        """Classification loss (NLL)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        assert 'pred_logits' in outputs
+        src_logits = outputs['pred_logits']
 
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(src_logits.shape[:2], 0,
+                                    dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_classes_o
+
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+        losses = {'loss_ce': loss_ce}
+
+        return losses
+
+    def loss_points(self, outputs, targets, indices, num_points):
+
+        assert 'pred_points' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_points = outputs['pred_points'][idx]
+        target_points = torch.cat([t['point'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+        loss_bbox = F.mse_loss(src_points, target_points, reduction='none')
+
+        losses = {}
+        losses['loss_point'] = loss_bbox.sum() / num_points
+
+        return losses
+
+    def _get_src_permutation_idx(self, indices):
+        # permute predictions following indices
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx = torch.cat([src for (src, _) in indices])
+        return batch_idx, src_idx
+
+    def _get_tgt_permutation_idx(self, indices):
+        # permute targets following indices
+        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
+        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
+        return batch_idx, tgt_idx
+
+    def get_loss(self, loss, outputs, targets, indices, num_points, **kwargs):
+        '''类似controller转发器的作用'''
+        loss_map = {
+            'labels': self.loss_labels,
+            'points': self.loss_points,
+        }
+        assert loss in loss_map, f'do you really want to compute {loss} loss?'
+        return loss_map[loss](outputs, targets, indices, num_points, **kwargs)
+
+    def forward(self, outputs, targets):
+        """ This performs the loss computation.
+        Parameters:
+             outputs: dict of tensors, see the output specification of the model for the format
+             targets: list of dicts, such that len(targets) == batch_size.
+                      The expected keys in each dict depends on the losses applied, see each loss' doc
+        """
+        output1 = {'pred_logits': outputs['pred_logits'], 'pred_points': outputs['pred_points']}
+
+        indices1 = self.matcher(output1, targets)
+
+        num_points = sum(len(t["labels"]) for t in targets)
+        num_points = torch.as_tensor([num_points], dtype=torch.float, device=next(iter(output1.values())).device)
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(num_points)
+        num_boxes = torch.clamp(num_points / get_world_size(), min=1).item()
+
+        losses = {}
+        for loss in self.losses:
+            losses.update(self.get_loss(loss, output1, targets, indices1, num_boxes))
+
+        return losses
+
+
+def build_model(args):
+    ''' return p2pnet '''
+    backbone = BackboneBase_VGG(backbone_name = args.backbone, \
+                                pretrained = True, \
+                                return_interm_layers = True)
     model = P2PNet(backbone, args.row, args.line)
-    if not training: 
-        return model
+    return model
 
-    weight_dict = {'loss_ce': 1, 'loss_points': args.point_loss_coef}
 
+def build_criterion(args):
+    ''' return criterion '''
+    matcher = HungarianMatcher_Crowd(cost_class=args.set_cost_class, \
+                                     cost_point=args.set_cost_point)
+
+    num_classes = 1
     losses = ['labels', 'points']
-    matcher = HungarianMatcher_Crowd(cost_class=args.set_cost_class, cost_point=args.set_cost_point)
-    criterion = SetCriterion_Crowd(num_classes, \
-                                matcher=matcher, weight_dict=weight_dict, \
-                                eos_coef=args.eos_coef, losses=losses)
-
-    return model, criterion
+    weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_points': args.point_loss_coef}
+    criterion = SetCriterion_Crowd( num_classes, \
+                                    matcher=matcher, weight_dict=weight_dict, \
+                                    eos_coef=args.eos_coef, losses=losses)
+    return criterion
