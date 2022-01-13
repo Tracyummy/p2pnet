@@ -15,6 +15,7 @@ import numpy as np
 import time
 import torchvision.transforms as standard_transforms
 import cv2
+import torch.nn.functional as F
 
 
 class DeNormalize(object):
@@ -82,6 +83,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     model.train()
     criterion.train()
     loss = 0
+
     # iterate all training samples
     for samples, targets in tqdm.tqdm(data_loader):
         samples = samples.to(device)
@@ -137,6 +139,97 @@ def evaluate_crowd_no_overlap(model, data_loader, device, vis_dir=None):
 
         points = outputs_points[outputs_scores > threshold].detach().cpu().numpy().tolist()
         predict_cnt = int((outputs_scores > threshold).sum())
+        # if specified, save the visualized images
+        if vis_dir is not None: 
+            vis(samples, targets, [points], vis_dir)
+        # accumulate MAE, MSE
+        mae = abs(predict_cnt - gt_cnt)
+        mse = (predict_cnt - gt_cnt) * (predict_cnt - gt_cnt)
+        maes.append(float(mae))
+        mses.append(float(mse))
+    # calc MAE, MSE
+    mae = np.mean(maes)
+    mse = np.sqrt(np.mean(mses))
+
+    return mae, mse
+
+
+# the inference routine
+@torch.no_grad()
+def evaluate_crowd_resize_x(model, data_loader, device, vis_dir=None, x=1000):
+    ''' bs为1，阈值0.5 过滤得到预测点 '''
+
+    model.eval()
+
+    # run inference on all images to calc MAE
+    maes = []
+    mses = []
+    for samples, targets in tqdm.tqdm(data_loader):
+        samples = samples.to(device)
+
+        outputs = model(samples)
+        outputs_scores = torch.nn.functional.softmax(outputs['pred_logits'], -1)[:, :, 1][0]
+
+        outputs_points = outputs['pred_points'][0]
+
+        gt_cnt = targets[0]['point'].shape[0]
+        # 0.5 is used by default
+        threshold = 0.5
+
+        points = outputs_points[outputs_scores > threshold].detach().cpu().numpy().tolist()
+        predict_cnt = int((outputs_scores > threshold).sum())
+        # if specified, save the visualized images
+        if vis_dir is not None: 
+            vis(samples, targets, [points], vis_dir)
+        # accumulate MAE, MSE
+        mae = abs(predict_cnt - gt_cnt)
+        mse = (predict_cnt - gt_cnt) * (predict_cnt - gt_cnt)
+        maes.append(float(mae))
+        mses.append(float(mse))
+    # calc MAE, MSE
+    mae = np.mean(maes)
+    mse = np.sqrt(np.mean(mses))
+
+    return mae, mse
+
+
+# the inference routine
+@torch.no_grad()
+def evaluate_crowd_crop_x(model, data_loader, device, vis_dir=None, x=512):
+    ''' bs为1，阈值0.5 过滤得到预测点 '''
+
+    model.eval()
+
+    # run inference on all images to calc MAE
+    maes = []
+    mses = []
+    for samples, targets in tqdm.tqdm(data_loader):
+        samples = samples.to(device)
+        gt_cnt = targets[0]['point'].shape[0]
+
+        h,w = samples.shape[2:]
+        newh = math.ceil(h/x) * x
+        neww = math.ceil(w/x) * x
+        diffh, diffw = newh - h, neww - w
+        leftpad, rightpad = diffw//2, diffw - diffw//2
+        toppad, bottompad = diffh//2, diffh - diffh//2
+
+        samples = F.pad(samples, (leftpad, rightpad, toppad, bottompad), "constant", 0)
+
+        # 0.5 is used by default
+        threshold = 0.5
+
+        predict_cnt = 0
+        for i in range(0, newh, x):
+            for j in range(0, neww, x):
+                tmpimg = samples[:, :, i:i+x, j:j+x]
+                outputs = model(tmpimg)
+                outputs_scores = torch.nn.functional.softmax(outputs['pred_logits'], -1)[:, :, 1][0]
+                outputs_points = outputs['pred_points'][0]
+                predict_cnt += int((outputs_scores > threshold).sum())
+        
+
+        points = outputs_points[outputs_scores > threshold].detach().cpu().numpy().tolist()
         # if specified, save the visualized images
         if vis_dir is not None: 
             vis(samples, targets, [points], vis_dir)

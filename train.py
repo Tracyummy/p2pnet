@@ -9,7 +9,7 @@ import torch
 import torchvision.transforms as standard_transforms
 from torch.utils.data import DataLoader, DistributedSampler
 
-from crowd_datasets.dataset import SHHATechA, NWPU
+from crowd_datasets.dataset import QNRF, SHHATechA, NWPU, SHHBTechB
 from engine import *
 from models.p2pnet import build_model
 from models.p2pnet import build_criterion
@@ -109,17 +109,23 @@ def main(args):
     optimizer = torch.optim.Adam(param_dicts, lr=args.lr)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
 
-    assert args.dataset_file in ["SHHATechA", "NWPU", "QNRF"], "dataset_file not in [\"SHHATechA\", \"NWPU\", \"QNRF\"]"
+    assert args.dataset_file in ["SHHATechA", "NWPU", "QNRF", "SHHBTechB"], "dataset_file not in [\"SHHATechA\", \"NWPU\", \"QNRF\"]"
 
     # create the dataset
     # create the training and valiation set
     if args.dataset_file in "SHHATechA":
         train_set = SHHATechA(data_root = args.data_root, train=True, patch=True, flip=True)
         val_set = SHHATechA(data_root = args.data_root, train=False, patch=False, flip=False)
+    elif args.dataset_file in "SHHBTechB":
+        train_set = SHHBTechB(data_root = args.data_root, train=True, patch=True, flip=True)
+        val_set = SHHBTechB(data_root = args.data_root, train=False, patch=False, flip=False)
     elif args.dataset_file in "NWPU":
         train_set = NWPU(data_root = args.data_root, train=True, patch=True, flip=True)
         val_set = NWPU(data_root = args.data_root, train=False, patch=False, flip=False)
-    
+    elif args.dataset_file in "QNRF":
+        train_set = QNRF(data_root = args.data_root, train=True, patch=True, flip=True)
+        val_set = QNRF(data_root = args.data_root, train=False, patch=False, flip=False)
+
     # create the sampler used during training
     sampler_train = torch.utils.data.RandomSampler(train_set)
     sampler_val = torch.utils.data.SequentialSampler(val_set)
@@ -131,11 +137,11 @@ def main(args):
 
     mae = []
     mse = []
+    bestmae = 100000
     print("【***************Start Training****************】")
 
-
     for epoch in range(args.start_epoch, args.epochs):
-        print("【Training\t {} 】".format(epoch))
+        print("【**********Training  {} **********】".format(epoch))
         stat = train_one_epoch(model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm)
 
         # change lr according to the scheduler
@@ -144,11 +150,13 @@ def main(args):
         torch.save({'model': model_without_ddp.state_dict(),}, os.path.join(args.checkpoints_dir, 'latest.pth'))
 
         if epoch % args.eval_freq == 0 and epoch > 0:
-            print("【Evaluating\t {} 】".format(epoch))
-            result = evaluate_crowd_no_overlap(model, data_loader_val, device)
+            print("【Evaluating  {} **********】".format(epoch))
+            result = evaluate_crowd_crop_x(model, data_loader_val, device)
             mae.append(result[0])
             mse.append(result[1])
-            print("MAE: {}\t MSE: {}".format(result[0], result[1]))
+            if bestmae > result[0]:
+                bestmae = result[0]
+            print("MAE: {}\t MSE: {}\t BestMAE: {}\n ".format(result[0], result[1], bestmae))
             if abs(np.min(mae) - result[0]) < 0.01:
                 torch.save({'model': model_without_ddp.state_dict(),}, os.path.join(args.checkpoints_dir, 'best_mae_{}.pth'.format(epoch)))
 
